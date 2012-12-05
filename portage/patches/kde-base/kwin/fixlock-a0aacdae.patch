@@ -1,0 +1,191 @@
+commit a0aacdae08a6bdae0a30139d65ef92d5dff136e5
+Author: Thomas Lübking <thomas.luebking@gmail.com>
+Date:   Sat Nov 3 21:33:34 2012 +0100
+
+    use QELapsedTimer to measure animation delay
+    
+    QElapsedTimer uses a monotic clock on all relevant systems
+    and is thus invarant against date/time changes (while the
+    bug was likely caused by daybreaks)
+    
+    BUG: 306186
+    REVIEW: 107250
+    FIXED-IN: 4.10
+    
+    use monitc clock
+
+diff --git a/kwin/libkwineffects/anidata.cpp b/kwin/libkwineffects/anidata.cpp
+index 3bb970f..f1a07d4 100644
+--- a/kwin/libkwineffects/anidata.cpp
++++ b/kwin/libkwineffects/anidata.cpp
+@@ -29,7 +29,7 @@ AniData::AniData()
+ {
+     attribute = AnimationEffect::Opacity;
+     windowType = (NET::WindowTypeMask)0;
+-    duration = time = meta = 0;
++    duration = time = meta = startTime = 0;
+     waitAtSource = false;
+ }
+ 
+@@ -37,7 +37,6 @@ AniData::AniData(AnimationEffect::Attribute a, int meta, int ms, const FPx2 &to,
+                  QEasingCurve curve, int delay, const FPx2 &from, bool waitAtSource )
+ {
+     attribute = a;
+-    startTime = QTime::currentTime().addMSecs(delay);
+     this->from = from;
+     this->to = to;
+     this->curve = curve;
+@@ -45,6 +44,7 @@ AniData::AniData(AnimationEffect::Attribute a, int meta, int ms, const FPx2 &to,
+     time = 0;
+     this->meta = meta;
+     this->waitAtSource = waitAtSource;
++    startTime = AnimationEffect::clock() + delay;
+ }
+ 
+ AniData::AniData(const AniData &other)
+@@ -54,11 +54,11 @@ AniData::AniData(const AniData &other)
+     to = other.to;
+     time = other.time;
+     duration = other.duration;
+-    startTime = other.startTime;
+     curve = other.curve;
+     customCurve = other.customCurve;
+     windowType = other.windowType;
+     meta = other.meta;
++    startTime = other.startTime;
+ }
+ 
+ static FPx2 fpx2(const QString &s, AnimationEffect::Attribute a)
+diff --git a/kwin/libkwineffects/anidata_p.h b/kwin/libkwineffects/anidata_p.h
+index 33d8c03..df4e088 100644
+--- a/kwin/libkwineffects/anidata_p.h
++++ b/kwin/libkwineffects/anidata_p.h
+@@ -23,7 +23,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ 
+ #include "kwinanimationeffect.h"
+ #include <QEasingCurve>
+-#include <QTime>
+ #include <netwm.h>
+ 
+ namespace KWin {
+@@ -47,7 +46,7 @@ public:
+     FPx2 from, to;
+     int time, duration;
+     uint meta;
+-    QTime startTime;
++    qint64 startTime;
+     NET::WindowTypeMask windowType;
+     bool waitAtSource;
+ };
+diff --git a/kwin/libkwineffects/kwinanimationeffect.cpp b/kwin/libkwineffects/kwinanimationeffect.cpp
+index 0e126dc..e0a6694 100644
+--- a/kwin/libkwineffects/kwinanimationeffect.cpp
++++ b/kwin/libkwineffects/kwinanimationeffect.cpp
+@@ -21,10 +21,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ #include "kwinanimationeffect.h"
+ #include "anidata_p.h"
+ 
+-#include <QTime>
++#include <QDateTime>
+ #include <QTimer>
+ 
+ namespace KWin {
++
++QElapsedTimer AnimationEffect::s_clock;
++
+ struct AnimationEffectPrivate {
+ public:
+     AnimationEffectPrivate() { m_animated = m_damageDirty = false; }
+@@ -40,6 +43,8 @@ AnimationEffect::AnimationEffect() : d_ptr(new AnimationEffectPrivate())
+ {
+     Q_D(AnimationEffect);
+     d->m_animated = false;
++    if (!s_clock.isValid())
++        s_clock.start();
+     /* this is the same as the QTimer::singleShot(0, SLOT(init())) kludge
+      * defering the init and esp. the connection to the windowClosed slot */
+     QMetaObject::invokeMethod( this, "init", Qt::QueuedConnection );
+@@ -202,7 +207,7 @@ void AnimationEffect::prePaintScreen( ScreenPrePaintData& data, int time )
+         bool invalidateLayerRect = false;
+         QList<AniData>::iterator anim = entry->first.begin(), animEnd = entry->first.end();
+         while (anim != animEnd) {
+-            if (QTime::currentTime() < anim->startTime) {
++            if (anim->startTime > clock()) {
+                 if (!anim->waitAtSource) {
+                     ++anim;
+                     continue;
+@@ -347,7 +352,7 @@ void AnimationEffect::prePaintWindow( EffectWindow* w, WindowPrePaintData& data,
+         if ( entry != d->m_animations.constEnd() ) {
+             bool isUsed = false;
+             for (QList<AniData>::const_iterator anim = entry->first.constBegin(); anim != entry->first.constEnd(); ++anim) {
+-                if (QTime::currentTime() < anim->startTime && !anim->waitAtSource)
++                if (anim->startTime > clock() && !anim->waitAtSource)
+                     continue;
+ 
+                 isUsed = true;
+@@ -392,7 +397,7 @@ void AnimationEffect::paintWindow( EffectWindow* w, int mask, QRegion region, Wi
+         if ( entry != d->m_animations.constEnd() ) {
+             for ( QList<AniData>::const_iterator anim = entry->first.constBegin(); anim != entry->first.constEnd(); ++anim ) {
+ 
+-                if (QTime::currentTime() < anim->startTime && !anim->waitAtSource)
++                if (anim->startTime > clock() && !anim->waitAtSource)
+                     continue;
+ 
+                 switch (anim->attribute) {
+@@ -511,14 +516,14 @@ void AnimationEffect::postPaintScreen()
+ 
+ float AnimationEffect::interpolated( const AniData &a, int i ) const
+ {
+-    if (QTime::currentTime() < a.startTime)
++    if (a.startTime > clock())
+         return a.from[i];
+     return a.from[i] + a.curve.valueForProgress( ((float)a.time)/a.duration )*(a.to[i] - a.from[i]);
+ }
+ 
+ float AnimationEffect::progress( const AniData &a ) const
+ {
+-    if (QTime::currentTime() < a.startTime)
++    if (a.startTime > clock())
+         return 0.0;
+     return a.curve.valueForProgress( ((float)a.time)/a.duration );
+ }
+@@ -630,7 +635,7 @@ void AnimationEffect::updateLayerRepaints()
+         QList<QRect> rects;
+         QRect *layerRect = const_cast<QRect*>(&(entry->second));
+         for (QList<AniData>::const_iterator anim = entry->first.constBegin(), animEnd = entry->first.constEnd(); anim != animEnd; ++anim) {
+-            if (QTime::currentTime() < anim->startTime)
++            if (anim->startTime > clock())
+                 continue;
+             switch (anim->attribute) {
+                 case Opacity:
+diff --git a/kwin/libkwineffects/kwinanimationeffect.h b/kwin/libkwineffects/kwinanimationeffect.h
+index 2ffaa22..76a5b9b 100644
+--- a/kwin/libkwineffects/kwinanimationeffect.h
++++ b/kwin/libkwineffects/kwinanimationeffect.h
+@@ -22,6 +22,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ #define ANIMATION_EFFECT_H
+ 
+ #include <QEasingCurve>
++#include <QElapsedTimer>
+ #include <QtCore/qmath.h>
+ #include <kwineffects.h>
+ 
+@@ -139,6 +140,10 @@ public:
+         return qExp(progress);
+     }
+ 
++    static inline qint64 clock() {
++        return s_clock.elapsed();
++    }
++
+ protected:
+     /**
+      * The central function of this class - call it to create an animated transition of any supported attribute
+@@ -177,6 +182,7 @@ private Q_SLOTS:
+     void _windowDeleted( KWin::EffectWindow* w );
+     void _expandedGeometryChanged(KWin::EffectWindow *w, const QRect &old);
+ private:
++    static QElapsedTimer s_clock;
+     typedef QMap< EffectWindow*, QPair<QList<AniData>, QRect> > AniMap;
+     AnimationEffectPrivate * const d_ptr;
+     Q_DECLARE_PRIVATE(AnimationEffect)
